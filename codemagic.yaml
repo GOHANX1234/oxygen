@@ -1,0 +1,67 @@
+workflows:
+  oxygen-s-debug:
+    name: Oxygen S - Debug Build
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      # Debug builds are unsigned (Android's default debug keystore), so no
+      # android_signing group is needed here. Add one only if you switch this
+      # workflow to a signed build.
+      vars:
+        PACKAGE_NAME: "com.oxygens.app"
+      ndk: 26.1.10909125
+      java: 17
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+    scripts:
+      - name: Set execute permission for gradlew
+        script: chmod +x ./gradlew
+      - name: Build debug APK
+        script: |
+          ./gradlew :app:assembleDebug --stacktrace
+      - name: Run unit tests
+        script: |
+          ./gradlew test --stacktrace
+    artifacts:
+      - app/build/outputs/**/*.apk
+      - app/build/outputs/**/mapping.txt
+    # No publishing integrations configured yet. Add e.g.:
+    # publishing:
+    #   email:
+    #     recipients:
+    #       - you@example.com
+
+  oxygen-s-release:
+    name: Oxygen S - Release Build
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment:
+      groups:
+        - keystore_credentials
+      android_signing:
+        - oxygen_s_keystore # configure in Codemagic UI: Team settings > Code signing identities
+      vars:
+        PACKAGE_NAME: "com.oxygens.app"
+      ndk: 26.1.10909125
+      java: 17
+    triggering:
+      events:
+        - tag
+    scripts:
+      - name: Set execute permission for gradlew
+        script: chmod +x ./gradlew
+      - name: Build release bundle
+        script: |
+          ./gradlew :app:bundleRelease --stacktrace
+    artifacts:
+      - app/build/outputs/**/*.aab
+      - app/build/outputs/**/mapping.txt
+    # No publishing integrations configured yet. Add e.g.:
+    # publishing:
+    #   email:
+    #     recipients:
+    #       - you@example.com
