@@ -6,6 +6,7 @@ import android.content.res.AssetManager
 import android.content.res.Resources
 import android.os.Bundle
 import android.util.Log
+import android.view.LayoutInflater
 import com.oxygens.app.OxygenApplication
 import com.oxygens.core.loader.GuestClassLoaderFactory
 import com.oxygens.core.virtual.VirtualCore
@@ -21,25 +22,33 @@ import java.io.File
  *
  * Android only launches Activity classes declared in Oxygen S's own manifest, so
  * StubActivityN is what Android instantiates and gives a real Window to. This base
- * class then:
- *   1. Builds a per-clone [GuestClassLoaderFactory]/[DexClassLoader] from the
- *      extracted guest APK path in [VirtualStorage].
+ * class then runs the Phase 1 guest delegation pipeline:
+ *
+ *   1. Builds a per-clone [GuestClassLoaderFactory]/DexClassLoader from the
+ *      extracted guest APK stored in VirtualStorage.
  *   2. Loads guest [Resources]/[AssetManager] via the hidden-but-stable
  *      `AssetManager.addAssetPath` reflection path (plan §4.6).
- *   3. Wraps this Activity's [Context] in a [GuestContextWrapper] so the guest's
- *      `getResources()`, `getPackageName()`, `getFilesDir()`, etc. all redirect
- *      correctly.
- *   4. Instantiates the guest Activity class and copies the minimal set of
- *      Activity-internal fields (window, instrumentation, application, main thread)
- *      from this already-attached stub onto the guest instance — avoiding the
- *      version-dependent hidden `Activity.attach()` signature entirely.
- *   5. Calls the guest's `onCreate` (and later `onResume`/`onPause`/`onDestroy`) via
- *      reflection, so the guest's UI renders inside our real window.
+ *   3. Wraps this Activity's Context in [GuestContextWrapper] so the guest's
+ *      `getResources()`, `getPackageName()`, `getFilesDir()`, etc. redirect correctly.
+ *   4. Instantiates the guest Activity class via the DexClassLoader.
+ *   5. Copies the minimal set of Activity-internal fields (mBase, mApplication,
+ *      mWindow, mWindowManager, mInstrumentation, mMainThread) from this
+ *      already-attached stub onto the guest instance — avoiding the version-dependent
+ *      hidden `Activity.attach()` signature entirely.
+ *   6. **Critical for rendering**: sets `window.callback = guestActivity` (public API)
+ *      so event dispatch goes to the guest, and patches `window.layoutInflater.mContext`
+ *      to `guestContext` so that when guest's `setContentView(R.layout.xxx)` runs,
+ *      the LayoutInflater resolves layout IDs against guest APK resources rather than
+ *      the stub host's resources (which would cause Resources.NotFoundException and
+ *      silent finish). System decor resources (package 0x01) remain accessible because
+ *      Android's native resource layer always includes the framework package regardless
+ *      of which paths were explicitly added to the AssetManager.
+ *   7. Calls the guest's `onCreate` via a full class-hierarchy walk (handles the common
+ *      case where `onCreate` is declared on `AppCompatActivity`, not the leaf class).
+ *   8. Delegates `onResume`/`onPause`/`onDestroy` to the guest instance by reflection.
  *
- * Field copies use `isAccessible = true`; this works on API 28-35 in non-debuggable
- * builds if the app is whitelisted (or native-hook exemption is active — plan §4.6).
- * Failures are caught and logged; a failed copy degrades the guest's UI rather than
- * crashing Oxygen S itself.
+ * All reflection failures are logged but do not crash Oxygen S — a copy that fails
+ * degrades the guest's UI rather than killing the host.
  */
 open class StubActivity : Activity() {
 
@@ -47,7 +56,7 @@ open class StubActivity : Activity() {
     private var guestPackageName: String? = null
     private var guestClassName: String? = null
 
-    /** The live guest Activity instance; non-null after [launchGuestActivity] succeeds. */
+    /** Live guest Activity instance; non-null after [launchGuestActivity] succeeds. */
     private var guestInstance: Activity? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,9 +75,18 @@ open class StubActivity : Activity() {
 
         try {
             launchGuestActivity(savedInstanceState)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch guest $guestClassName in clone $cloneId", e)
-            // Report destroyed so VAMS releases the stub slot
+        } catch (t: Throwable) {
+            // Rethrow truly fatal VM conditions — attempting to catch and continue
+            // after OOM / StackOverflow / ThreadDeath leaves the process in an
+            // undefined state that is worse than a fast crash.
+            if (t is VirtualMachineError || t is ThreadDeath) throw t
+
+            // For all other Throwable subclasses (including Error subclasses like
+            // NoClassDefFoundError / ExceptionInInitializerError / LinkageError),
+            // finish gracefully rather than crashing the whole :clone_N process and
+            // taking the host Oxygen S UI with it.
+            Log.e(TAG, "Failed to launch guest $guestClassName in clone $cloneId", t)
+            restoreWindowCallback()
             reportLifecycle(ActivityLifecycleState.DESTROYED)
             finish()
         }
@@ -79,17 +97,18 @@ open class StubActivity : Activity() {
     override fun onResume() {
         super.onResume()
         reportLifecycle(ActivityLifecycleState.RESUMED)
-        guestInstance?.let { delegateLifecycle(it, "onResume") }
+        guestInstance?.let { delegateVoid(it, "onResume") }
     }
 
     override fun onPause() {
-        guestInstance?.let { delegateLifecycle(it, "onPause") }
+        guestInstance?.let { delegateVoid(it, "onPause") }
         reportLifecycle(ActivityLifecycleState.PAUSED)
         super.onPause()
     }
 
     override fun onDestroy() {
-        guestInstance?.let { delegateLifecycle(it, "onDestroy") }
+        guestInstance?.let { delegateVoid(it, "onDestroy") }
+        restoreWindowCallback()
         reportLifecycle(ActivityLifecycleState.DESTROYED)
         super.onDestroy()
     }
@@ -102,12 +121,18 @@ open class StubActivity : Activity() {
         val cls = guestClassName!!
         val storage = (application as OxygenApplication).virtualStorage
 
-        // ── Step 1: locate the extracted APK ─────────────────────────────────
+        // ── 1. Locate the extracted guest APK ────────────────────────────────
         // VirtualStorage.extractGuestApk() always writes to apkDir(cloneId, pkg)/base.apk.
-        val guestApkPath = File(storage.apkDir(cloneId, pkg), "base.apk").absolutePath
+        val guestApkPath = File(storage.apkDir(cloneId, pkg), "base.apk").let { f ->
+            check(f.exists()) {
+                "Extracted APK not found at ${f.absolutePath} for clone $cloneId/$pkg. " +
+                    "The clone may need to be reinstalled."
+            }
+            f.absolutePath
+        }
+        Log.d(TAG, "Guest APK: $guestApkPath")
 
-        // ── Step 2: build a per-clone DexClassLoader ──────────────────────────
-        // optimizedDirectory lives under codeCacheDir (per-app, survives upgrades).
+        // ── 2. Build a per-clone DexClassLoader ───────────────────────────────
         val optDir = File(codeCacheDir, "dex_opt_$cloneId/${pkg.replace('.', '_')}")
         val nativeLibDir = storage.nativeLibDir(cloneId, pkg)
         val classLoader = GuestClassLoaderFactory(this).create(
@@ -115,31 +140,15 @@ open class StubActivity : Activity() {
             optimizedDirectory = optDir,
             nativeLibraryDir = nativeLibDir,
         )
-        Log.d(TAG, "DexClassLoader ready for $pkg (clone $cloneId) apk=$guestApkPath")
+        Log.d(TAG, "DexClassLoader ready for $pkg (clone $cloneId)")
 
-        // ── Step 3: load guest AssetManager + Resources via reflection ────────
-        // AssetManager() constructor and addAssetPath() are both @hide.
-        // We instantiate via the no-arg constructor (isAccessible) and then call
-        // addAssetPath to register the guest APK as an asset source.
-        val assetManager: AssetManager = try {
-            val ctor = AssetManager::class.java.getDeclaredConstructor()
-            ctor.isAccessible = true
-            ctor.newInstance()
-        } catch (e: Exception) {
-            // Fallback: try newInstance() directly (works on some OEM builds)
-            @Suppress("DEPRECATION")
-            AssetManager::class.java.newInstance()
-        }
-
-        try {
-            val addAssetPath = AssetManager::class.java.getDeclaredMethod(
-                "addAssetPath", String::class.java)
-            addAssetPath.isAccessible = true
-            addAssetPath.invoke(assetManager, guestApkPath)
-            Log.d(TAG, "Guest AssetManager loaded for $guestApkPath")
-        } catch (e: Exception) {
-            Log.w(TAG, "addAssetPath reflection failed — guest resources may be missing: ${e.message}")
-        }
+        // ── 3. Load guest AssetManager + Resources via reflection ─────────────
+        // AssetManager() and addAssetPath() are both @hide. We instantiate via the
+        // no-arg constructor (isAccessible) and call addAssetPath to register the
+        // guest APK as an asset source. System resources (package 0x01) remain
+        // accessible because the Android native resource layer includes the framework
+        // package in every AssetManager regardless of what app paths are added.
+        val assetManager = createAssetManager(guestApkPath)
 
         @Suppress("DEPRECATION")
         val guestResources = Resources(
@@ -148,7 +157,7 @@ open class StubActivity : Activity() {
             resources.configuration,
         )
 
-        // ── Step 4: build GuestContextWrapper ────────────────────────────────
+        // ── 4. Build GuestContextWrapper ──────────────────────────────────────
         val guestContext = GuestContextWrapper(
             base = this,
             guestResources = guestResources,
@@ -158,103 +167,241 @@ open class StubActivity : Activity() {
             storage = storage,
         )
 
-        // ── Step 5: instantiate guest Activity class ──────────────────────────
+        // ── 5. Instantiate the guest Activity class ───────────────────────────
         val guestClass = classLoader.loadClass(cls)
-        Log.d(TAG, "Loaded guest class $cls from clone $cloneId")
         val guestActivity = guestClass.getDeclaredConstructor().newInstance() as Activity
+        Log.d(TAG, "Guest class $cls instantiated")
 
-        // ── Step 6: attach guest to our window via field reflection ───────────
-        // We set the ContextWrapper base to our GuestContextWrapper so that
-        // getResources()/getPackageName()/getFilesDir() all redirect correctly.
-        reflectSetField(android.content.ContextWrapper::class.java, "mBase",
-            guestActivity, guestContext)
+        // ── 6. Copy essential Activity fields stub → guest ────────────────────
+        // Set mBase first so the guest's ContextWrapper is valid before anything
+        // calls back into it (e.g. window.callback = guestActivity below triggers
+        // no callbacks yet, but AppCompatActivity reads getPackageName() early).
+        reflectSet(android.content.ContextWrapper::class.java, "mBase", guestActivity, guestContext)
+        reflectSet(Activity::class.java, "mApplication", guestActivity, application)
+        // Share our already-attached window and window manager. The guest's
+        // setContentView() will render into this real window.
+        reflectCopy(Activity::class.java, "mWindow",        guestActivity)
+        reflectCopy(Activity::class.java, "mWindowManager", guestActivity)
+        // Instrumentation and ActivityThread: same process, safe to share.
+        reflectCopy(Activity::class.java, "mInstrumentation", guestActivity)
+        reflectCopy(Activity::class.java, "mMainThread",      guestActivity)
+        // Configuration for the running process.
+        reflectCopy(Activity::class.java, "mCurrentConfig", guestActivity)
 
-        // Share our already-attached Application, Window, WindowManager,
-        // Instrumentation, and ActivityThread with the guest. These are safe to
-        // share because:
-        //   • mWindow   — the guest's setContentView() renders into our real window.
-        //   • mApplication — OxygenApplication; guest code using getApplicationContext()
-        //                    gets our app (acceptable for Phase 1).
-        //   • mInstrumentation / mMainThread — same process, same thread model.
-        // mToken is intentionally NOT copied: it is the Binder handle AMS uses to
-        // identify *this* stub Activity. If the guest had the same token, finishing
-        // it via reflection could double-finish the stub window.
-        reflectCopyField(Activity::class.java, "mApplication", guestActivity)
-        reflectCopyField(Activity::class.java, "mWindow", guestActivity)
-        reflectCopyField(Activity::class.java, "mWindowManager", guestActivity)
-        reflectCopyField(Activity::class.java, "mInstrumentation", guestActivity)
-        reflectCopyField(Activity::class.java, "mMainThread", guestActivity)
-        // mCurrentConfig lets the guest respond to configuration changes correctly
-        reflectCopyField(Activity::class.java, "mCurrentConfig", guestActivity)
+        // ── 7. Wire window callback to guest ──────────────────────────────────
+        // window.setCallback() is a public API. Setting it to the guest Activity
+        // before guest's onCreate() ensures:
+        //   a) AppCompatActivity.onCreate reads mWindow.getCallback() → guestActivity
+        //      and stores it as the "original" callback (correct).
+        //   b) Key/touch events dispatched by the framework go to the guest, not stub.
+        // mBase is already set above so callback calls into the guest Context are safe.
+        window.callback = guestActivity
 
-        // ── Step 7: call guest onCreate() via reflection ──────────────────────
-        // We find onCreate() on the guest's own class first; if not overridden,
-        // walk up to Activity.onCreate(Bundle) in the framework.
-        val onCreateMethod = try {
-            guestClass.getDeclaredMethod("onCreate", Bundle::class.java)
-                .also { it.isAccessible = true }
-        } catch (_: NoSuchMethodException) {
-            Activity::class.java.getDeclaredMethod("onCreate", Bundle::class.java)
-                .also { it.isAccessible = true }
-        }
+        // ── 8. Patch the window's LayoutInflater to use guest resources ────────
+        // ROOT CAUSE OF THE CRASH: without this patch, when the guest calls
+        // setContentView(R.layout.activity_main), PhoneWindow.setContentView()
+        // uses its internal mLayoutInflater (whose mContext = stub Activity) to
+        // inflate the layout. The stub doesn't have the guest's resources, so
+        // LayoutInflater.inflate() throws Resources.NotFoundException.
+        //
+        // We patch mContext *inside* the existing LayoutInflater object (returned by
+        // the public window.layoutInflater getter) rather than replacing the inflater
+        // itself. This is safe because:
+        //   • System decor layouts (0x01xxxxxx IDs) still resolve: Android's native
+        //     resource layer always includes the framework package in every app's
+        //     AssetManager.
+        //   • Guest layouts (0x7fxxxxxx IDs) now resolve against guestResources. ✓
+        //   • The same inflater instance is returned by getSystemService(LAYOUT_INFLATER)
+        //     via the stub Activity's Activity.getSystemService(), which GuestContextWrapper
+        //     inherits — so LayoutInflater.from(guestContext) also gets the patched one.
+        patchInflaterContext(guestContext)
+
+        // ── 9. Call guest's onCreate via full class-hierarchy walk ────────────
+        // getDeclaredMethod() only inspects the immediate class. Guest apps commonly
+        // declare onCreate on a base class (e.g. AppCompatActivity), so we walk up
+        // until we find the first class that declares onCreate(Bundle).
+        val onCreateMethod = findMethodOnHierarchy(guestClass, "onCreate", Bundle::class.java)
+            ?: error("No onCreate(Bundle) found on $cls or any of its superclasses")
         onCreateMethod.invoke(guestActivity, savedInstanceState)
-        Log.i(TAG, "Guest $cls onCreate() completed for clone $cloneId")
+        Log.i(TAG, "Guest $cls onCreate() completed for clone $cloneId ✓")
 
         guestInstance = guestActivity
     }
 
-    // ── Reflection helpers ────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /**
-     * Copy field [fieldName] (declared on [declaringClass]) from this stub Activity
-     * into [target]. Logs a warning on failure but does not throw.
+     * Create a guest [AssetManager] with [guestApkPath] added. Uses reflection to
+     * call the hidden no-arg constructor (and addAssetPath) with two fallbacks for
+     * OEM variants that moved the constructor.
      */
-    private fun reflectCopyField(declaringClass: Class<*>, fieldName: String, target: Any) {
-        try {
-            val f = declaringClass.getDeclaredField(fieldName)
-            f.isAccessible = true
-            f.set(target, f.get(this))
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun createAssetManager(guestApkPath: String): AssetManager {
+        val am: AssetManager = try {
+            val ctor = AssetManager::class.java.getDeclaredConstructor()
+            ctor.isAccessible = true
+            ctor.newInstance()
         } catch (e: Exception) {
-            Log.w(TAG, "reflectCopyField $fieldName from ${declaringClass.simpleName}: ${e.message}")
+            Log.w(TAG, "AssetManager no-arg ctor via getDeclaredConstructor failed (${e.message}); " +
+                "falling back to newInstance()")
+            @Suppress("DEPRECATION")
+            try {
+                AssetManager::class.java.newInstance()
+            } catch (e2: Exception) {
+                throw IllegalStateException(
+                    "Could not instantiate AssetManager via reflection — " +
+                        "hidden-API access is blocked on this build. " +
+                        "Native hidden-API exemption (plan §4.6) is required.", e2)
+            }
         }
+
+        try {
+            val addAssetPath = AssetManager::class.java
+                .getDeclaredMethod("addAssetPath", String::class.java)
+                .also { it.isAccessible = true }
+            val cookie = addAssetPath.invoke(am, guestApkPath) as? Int ?: 0
+            check(cookie != 0) {
+                "addAssetPath returned 0 for $guestApkPath — the APK file may be corrupt or missing."
+            }
+            Log.d(TAG, "addAssetPath cookie=$cookie for $guestApkPath")
+        } catch (e: Exception) {
+            throw IllegalStateException(
+                "addAssetPath reflection failed — guest resources will not be available.", e)
+        }
+
+        return am
     }
 
     /**
-     * Set field [fieldName] (declared on [declaringClass]) on [target] to [value].
-     * Logs a warning on failure but does not throw.
+     * Replace the window's LayoutInflater with one that resolves layouts against
+     * [guestContext]'s resources.
+     *
+     * **Why not patch `LayoutInflater.mContext` directly?**
+     * `mContext` is declared `protected final` in AOSP's `LayoutInflater`. Mutating a
+     * `final` field via reflection after construction is unreliable: ART on Android 12+
+     * may silently ignore the write, and some OEM builds enforce the restriction at the
+     * native layer. Any approach that relies on this is fragile across the API 28-35
+     * range we target.
+     *
+     * **The reliable alternative:**
+     * 1. `LayoutInflater.cloneInContext(guestContext)` — public API, creates a new
+     *    inflater whose `mContext` is correctly set to `guestContext` *in the
+     *    constructor* (no final-field mutation needed).
+     * 2. Replace `PhoneWindow.mLayoutInflater` with the cloned inflater via
+     *    reflection. This field is `private` but **NOT** `final` in PhoneWindow across
+     *    API 28-35, so `isAccessible = true` + `set()` is reliable.
+     *
+     * After this call, when the guest's `setContentView(R.layout.activity_main)` runs,
+     * `PhoneWindow.setContentView()` calls `mLayoutInflater.inflate(resId, ...)` which
+     * uses `guestContext.getResources()` (= guest APK resources) to resolve the ID. ✓
+     * System decor layouts (0x01xxxxxx IDs, used by installDecor) also continue to
+     * resolve because Android's native resource layer always includes the framework
+     * package in every app's AssetManager regardless of which APK paths were added.
      */
-    private fun reflectSetField(declaringClass: Class<*>, fieldName: String, target: Any, value: Any?) {
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun patchInflaterContext(guestContext: GuestContextWrapper) {
         try {
-            val f = declaringClass.getDeclaredField(fieldName)
-            f.isAccessible = true
-            f.set(target, value)
-        } catch (e: Exception) {
-            Log.w(TAG, "reflectSetField $fieldName on ${declaringClass.simpleName}: ${e.message}")
-        }
-    }
+            // Step 1: clone the existing inflater with the guest context (public API).
+            val guestInflater: LayoutInflater = window.layoutInflater.cloneInContext(guestContext)
 
-    /**
-     * Call a no-arg public/protected method [methodName] on [target] by walking its
-     * class hierarchy. Used for lifecycle callbacks (onResume/onPause/onDestroy).
-     */
-    private fun delegateLifecycle(target: Activity, methodName: String) {
-        try {
-            var klass: Class<*>? = target.javaClass
-            var method: java.lang.reflect.Method? = null
-            while (klass != null && method == null) {
-                method = try {
-                    klass.getDeclaredMethod(methodName)
-                } catch (_: NoSuchMethodException) {
-                    null
-                }
+            // Step 2: replace mLayoutInflater by walking window.javaClass up its
+            // superclass chain until the declaring class is found. This is more
+            // future-proof than hardcoding "com.android.internal.policy.PhoneWindow"
+            // which could move across OEM builds or Android versions.
+            val windowInstance = window
+            var klass: Class<*>? = windowInstance.javaClass
+            var layoutInflaterField: java.lang.reflect.Field? = null
+            while (klass != null && layoutInflaterField == null) {
+                layoutInflaterField = try {
+                    klass.getDeclaredField("mLayoutInflater").also { it.isAccessible = true }
+                } catch (_: NoSuchFieldException) { null }
                 klass = klass.superclass
             }
-            method?.also {
-                it.isAccessible = true
-                it.invoke(target)
-            } ?: Log.w(TAG, "delegateLifecycle: $methodName not found on ${target.javaClass.name}")
+
+            if (layoutInflaterField != null) {
+                layoutInflaterField.set(windowInstance, guestInflater)
+                Log.d(TAG, "mLayoutInflater (on ${layoutInflaterField.declaringClass.simpleName}) " +
+                    "replaced with guest-context inflater")
+            } else {
+                Log.e(TAG, "CRITICAL: mLayoutInflater field not found in window class hierarchy — " +
+                    "guest layouts will fail to inflate")
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "delegateLifecycle $methodName on ${target.javaClass.simpleName}: ${e.message}")
+            Log.e(TAG, "CRITICAL: Could not replace mLayoutInflater — guest layouts will " +
+                "fail to inflate. ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /** Restore window callback to the stub Activity so framework cleanup goes to the right place. */
+    private fun restoreWindowCallback() {
+        try { window.callback = this } catch (_: Exception) {}
+    }
+
+    /**
+     * Walk [startClass] and its superclasses until a class that declares
+     * [methodName] with the given [paramTypes] is found. Returns null if not found.
+     * This handles the common case where the guest's leaf class (e.g.
+     * `MainActivity extends AppCompatActivity`) doesn't itself declare `onCreate`
+     * — `getDeclaredMethod` would throw, but the method exists on `AppCompatActivity`.
+     */
+    private fun findMethodOnHierarchy(
+        startClass: Class<*>,
+        methodName: String,
+        vararg paramTypes: Class<*>,
+    ): java.lang.reflect.Method? {
+        var klass: Class<*>? = startClass
+        while (klass != null && klass != Any::class.java) {
+            try {
+                return klass.getDeclaredMethod(methodName, *paramTypes)
+                    .also { it.isAccessible = true }
+            } catch (_: NoSuchMethodException) {}
+            klass = klass.superclass
+        }
+        return null
+    }
+
+    /**
+     * Set [fieldName] (declared on [declaringClass]) on [target] to [value].
+     * Non-fatal: logs a warning if the field is not found or access is denied.
+     */
+    private fun reflectSet(declaringClass: Class<*>, fieldName: String, target: Any, value: Any?) {
+        try {
+            declaringClass.getDeclaredField(fieldName).also { it.isAccessible = true }.set(target, value)
+        } catch (e: Exception) {
+            Log.w(TAG, "reflectSet $fieldName on ${declaringClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
+     * Copy [fieldName] (declared on [declaringClass]) from this stub Activity
+     * to [target]. Non-fatal: logs a warning if the field is not found.
+     */
+    private fun reflectCopy(declaringClass: Class<*>, fieldName: String, target: Any) {
+        try {
+            val f = declaringClass.getDeclaredField(fieldName).also { it.isAccessible = true }
+            f.set(target, f.get(this))
+        } catch (e: Exception) {
+            Log.w(TAG, "reflectCopy $fieldName from ${declaringClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
+     * Invoke a no-arg method by walking the class hierarchy of [target].
+     * Used for lifecycle callbacks (onResume / onPause / onDestroy) so they are
+     * delegated even when declared on a superclass of the guest.
+     */
+    private fun delegateVoid(target: Activity, methodName: String) {
+        try {
+            val method = findMethodOnHierarchy(target.javaClass, methodName)
+                ?: return Unit.also {
+                    Log.w(TAG, "delegateVoid: $methodName not found on ${target.javaClass.name}")
+                }
+            method.invoke(target)
+        } catch (t: Throwable) {
+            // Mirror the fatal-rethrow policy from the top-level launch catch so that
+            // OOM / ThreadDeath during lifecycle callbacks also propagates correctly.
+            if (t is VirtualMachineError || t is ThreadDeath) throw t
+            Log.w(TAG, "delegateVoid $methodName on ${target.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -263,9 +410,6 @@ open class StubActivity : Activity() {
     private fun reportLifecycle(state: ActivityLifecycleState) {
         val className = guestClassName ?: return
         if (cloneId == -1) return
-        // Guards against calling into VirtualCore.vams before bootstrap ran (e.g. if
-        // a stub Activity is somehow started in the host process by mistake) — VAMS is
-        // a `lateinit var`, so an uninitialized access throws rather than NPEs.
         runCatching { VirtualCore.vams }.getOrNull()?.reportLifecycle(cloneId, className, state)
     }
 
